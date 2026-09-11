@@ -8,7 +8,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -64,16 +63,38 @@ fun SftpScreen(
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
 
+    fun formatSftpError(e: Exception): String {
+        val detail = e.message ?: e.javaClass.simpleName
+        val lower = detail.lowercase()
+        return when {
+            lower.contains("arrayindexoutofbounds") ||
+                lower.contains("dstpos") ||
+                lower.contains("src.length") ||
+                lower.contains("buffer") && lower.contains("index") ->
+                "SFTP 操作失败：连接状态异常（终端与文件传输冲突）。请断开后重连再试。\n$detail"
+            lower.contains("sftp 连接失败") || lower.contains("无法建立独立") ->
+                "无法打开文件传输：$detail"
+            lower.contains("未连接") ->
+                "未连接 SSH：$detail"
+            else -> "SFTP 错误：$detail"
+        }
+    }
+
     fun reload(p: String = path) {
         scope.launch {
             loading = true
             error = null
             try {
-                val list = sshManager.listRemote(p)
-                path = p
+                val absolute = try {
+                    sshManager.canonicalizeRemote(p)
+                } catch (_: Exception) {
+                    p
+                }
+                val list = sshManager.listRemote(absolute)
+                path = absolute
                 entries = list.filter { it.name != "." && it.name != ".." }
             } catch (e: Exception) {
-                error = e.message
+                error = formatSftpError(e)
             } finally {
                 loading = false
             }
@@ -82,15 +103,15 @@ fun SftpScreen(
 
     LaunchedEffect(Unit) {
         try {
-            val sftp = sshManager.openSftp()
+            sshManager.openSftp()
             val home = try {
-                sftp.canonicalize(".")
+                sshManager.canonicalizeRemote(".")
             } catch (_: Exception) {
                 "."
             }
             reload(home)
         } catch (e: Exception) {
-            error = e.message
+            error = formatSftpError(e)
             loading = false
         }
     }
@@ -115,7 +136,7 @@ fun SftpScreen(
                 Toast.makeText(context, context.getString(R.string.file_uploaded), Toast.LENGTH_SHORT).show()
                 reload()
             } catch (e: Exception) {
-                Toast.makeText(context, e.message ?: "上传失败", Toast.LENGTH_LONG).show()
+                Toast.makeText(context, formatSftpError(e), Toast.LENGTH_LONG).show()
                 loading = false
             }
         }
@@ -209,7 +230,7 @@ fun SftpScreen(
                                                     Toast.LENGTH_LONG,
                                                 ).show()
                                             } catch (e: Exception) {
-                                                Toast.makeText(context, e.message, Toast.LENGTH_LONG).show()
+                                                Toast.makeText(context, formatSftpError(e), Toast.LENGTH_LONG).show()
                                             }
                                         }
                                     }) {

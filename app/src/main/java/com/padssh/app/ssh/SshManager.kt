@@ -35,9 +35,16 @@ class SshManager(private val repository: HostRepository) {
     }
 
     private var client: SSHClient? = null
+    /** Host used for the active shell session; also used to open a dedicated SFTP connection. */
+    private var currentHost: HostEntity? = null
     private var shell: Session.Shell? = null
     private var session: Session? = null
+
+    /** Dedicated SSHClient for SFTP only — never share with the interactive shell (sshj #532/#461). */
+    private var sftpClient: SSHClient? = null
     private var sftp: SFTPClient? = null
+    private val sftpLock = Any()
+
     private val reading = AtomicBoolean(false)
 
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
@@ -77,27 +84,13 @@ class SshManager(private val repository: HostRepository) {
             ssh.timeout = 0
             ssh.connect(host.host, host.port)
 
-            if (host.useKeyAuth && !host.privateKey.isNullOrBlank()) {
-                val tmp = File.createTempFile("padssh_key", ".pem")
-                try {
-                    tmp.writeText(host.privateKey)
-                    val keys: KeyProvider = if (!host.keyPassphrase.isNullOrBlank()) {
-                        ssh.loadKeys(tmp.absolutePath, host.keyPassphrase)
-                    } else {
-                        ssh.loadKeys(tmp.absolutePath)
-                    }
-                    ssh.authPublickey(host.username, keys)
-                } finally {
-                    tmp.delete()
-                }
-            } else {
-                ssh.authPassword(host.username, host.password ?: "")
-            }
+            authClient(ssh, host)
 
             // SSH-level keep-alive so idle sessions are not dropped by NAT/server.
             ssh.connection.keepAlive.keepAliveInterval = 30
 
             client = ssh
+            currentHost = host
             _connectionState.value = ConnectionState.Connected(host.id, host.name)
             Result.success(Unit)
         } catch (e: Exception) {
@@ -105,6 +98,25 @@ class SshManager(private val repository: HostRepository) {
             val msg = e.message ?: e.javaClass.simpleName
             _connectionState.value = ConnectionState.Failed(msg)
             Result.failure(e)
+        }
+    }
+
+    private fun authClient(ssh: SSHClient, host: HostEntity) {
+        if (host.useKeyAuth && !host.privateKey.isNullOrBlank()) {
+            val tmp = File.createTempFile("padssh_key", ".pem")
+            try {
+                tmp.writeText(host.privateKey)
+                val keys: KeyProvider = if (!host.keyPassphrase.isNullOrBlank()) {
+                    ssh.loadKeys(tmp.absolutePath, host.keyPassphrase)
+                } else {
+                    ssh.loadKeys(tmp.absolutePath)
+                }
+                ssh.authPublickey(host.username, keys)
+            } finally {
+                tmp.delete()
+            }
+        } else {
+            ssh.authPassword(host.username, host.password ?: "")
         }
     }
 
@@ -168,29 +180,94 @@ class SshManager(private val repository: HostRepository) {
         }
     }
 
+    /**
+     * Ensures a dedicated secondary SSH connection for SFTP (separate from the shell client).
+     * Reuses [sftpClient] while it is alive; recreates if dead.
+     */
     suspend fun openSftp(): SFTPClient = withContext(Dispatchers.IO) {
-        sftp?.closeQuietly()
-        val ssh = client ?: error("未连接")
-        ssh.newSFTPClient().also { sftp = it }
+        synchronized(sftpLock) {
+            ensureSftpClientLocked()
+        }
     }
 
-    fun getSftp(): SFTPClient? = sftp
+    fun getSftp(): SFTPClient? = synchronized(sftpLock) { sftp }
+
+    private fun isSftpAlive(): Boolean {
+        val ssh = sftpClient ?: return false
+        return try {
+            ssh.isConnected && ssh.isAuthenticated
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun ensureSftpClientLocked(): SFTPClient {
+        if (sftp != null && isSftpAlive()) {
+            return sftp!!
+        }
+        closeSftpInternal()
+
+        val host = currentHost ?: error("未连接：无法打开 SFTP（无主机信息）")
+        if (client == null || client?.isConnected != true) {
+            error("未连接：请先建立 SSH 会话后再打开文件传输")
+        }
+
+        try {
+            val ssh = SSHClient(AndroidSshConfig())
+            // Prefer keys already stored after the shell connect; reuse same TOFU verifier
+            // so known keys auto-trust and unknown/changed keys can still prompt.
+            val verifier = tofuVerifier ?: TofuHostKeyVerifier(repository) { decision ->
+                _hostKeyPrompt.value = decision
+            }
+            ssh.addHostKeyVerifier(verifier)
+            ssh.connectTimeout = 15_000
+            ssh.timeout = 30_000
+            ssh.connect(host.host, host.port)
+            authClient(ssh, host)
+            ssh.connection.keepAlive.keepAliveInterval = 30
+
+            val sftpChannel = ssh.newSFTPClient()
+            sftpClient = ssh
+            sftp = sftpChannel
+            return sftpChannel
+        } catch (e: Exception) {
+            closeSftpInternal()
+            throw IllegalStateException(
+                "SFTP 连接失败：无法建立独立的文件传输连接。${e.message ?: e.javaClass.simpleName}",
+                e,
+            )
+        }
+    }
 
     suspend fun listRemote(path: String): List<RemoteResourceInfo> = withContext(Dispatchers.IO) {
-        val client = sftp ?: openSftp()
-        client.ls(path).sortedWith(
-            compareBy<RemoteResourceInfo> { !it.isDirectory }.thenBy { it.name.lowercase() },
-        )
+        synchronized(sftpLock) {
+            val client = ensureSftpClientLocked()
+            client.ls(path).sortedWith(
+                compareBy<RemoteResourceInfo> { !it.isDirectory }.thenBy { it.name.lowercase() },
+            )
+        }
     }
 
     suspend fun downloadFile(remotePath: String, localFile: File) = withContext(Dispatchers.IO) {
-        val client = sftp ?: openSftp()
-        client.get(remotePath, localFile.absolutePath)
+        synchronized(sftpLock) {
+            val client = ensureSftpClientLocked()
+            client.get(remotePath, localFile.absolutePath)
+        }
     }
 
     suspend fun uploadFile(localFile: File, remotePath: String) = withContext(Dispatchers.IO) {
-        val client = sftp ?: openSftp()
-        client.put(localFile.absolutePath, remotePath)
+        synchronized(sftpLock) {
+            val client = ensureSftpClientLocked()
+            client.put(localFile.absolutePath, remotePath)
+        }
+    }
+
+    /** Canonicalize a remote path on the dedicated SFTP connection. */
+    suspend fun canonicalizeRemote(path: String): String = withContext(Dispatchers.IO) {
+        synchronized(sftpLock) {
+            val client = ensureSftpClientLocked()
+            client.canonicalize(path)
+        }
     }
 
     suspend fun disconnect() = withContext(Dispatchers.IO) {
@@ -199,16 +276,26 @@ class SshManager(private val repository: HostRepository) {
         _connectionState.value = ConnectionState.Disconnected
     }
 
+    private fun closeSftpInternal() {
+        sftp?.closeQuietly()
+        sftp = null
+        try {
+            sftpClient?.disconnect()
+        } catch (_: Exception) {
+        }
+        sftpClient = null
+    }
+
     private fun disconnectInternal() {
         reading.set(false)
         stopShellInternal()
-        sftp?.closeQuietly()
-        sftp = null
+        closeSftpInternal()
         try {
             client?.disconnect()
         } catch (_: Exception) {
         }
         client = null
+        currentHost = null
         tofuVerifier = null
         _hostKeyPrompt.value = null
     }
