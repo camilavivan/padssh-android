@@ -2,17 +2,13 @@ package com.padssh.app.ssh
 
 import com.padssh.app.data.HostEntity
 import com.padssh.app.data.HostRepository
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import net.schmizz.sshj.SSHClient
 import net.schmizz.sshj.connection.channel.direct.Session
@@ -38,8 +34,6 @@ class SshManager(private val repository: HostRepository) {
         SecurityProviders.install()
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
     private var client: SSHClient? = null
     /** Host used for the active shell session; also used to open a dedicated SFTP connection. */
     private var currentHost: HostEntity? = null
@@ -52,9 +46,8 @@ class SshManager(private val repository: HostRepository) {
     private val sftpLock = Any()
 
     private val reading = AtomicBoolean(false)
-    /** When true, unexpected transport death triggers auto-reconnect. Cleared by user disconnect. */
-    private val autoReconnectEnabled = AtomicBoolean(false)
-    private val reconnecting = AtomicBoolean(false)
+    /** Guards against concurrent silent shell reattach attempts. */
+    private val shellReattaching = AtomicBoolean(false)
 
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
@@ -77,8 +70,6 @@ class SshManager(private val repository: HostRepository) {
     }
 
     suspend fun connect(host: HostEntity): Result<Unit> = withContext(Dispatchers.IO) {
-        autoReconnectEnabled.set(false)
-        reconnecting.set(false)
         disconnectInternal(clearHost = true)
         clearTerminalBuffer()
         _connectionState.value = ConnectionState.Connecting
@@ -86,11 +77,9 @@ class SshManager(private val repository: HostRepository) {
             val ssh = openAuthenticatedClient(host)
             client = ssh
             currentHost = host
-            autoReconnectEnabled.set(true)
             _connectionState.value = ConnectionState.Connected(host.id, host.name)
             Result.success(Unit)
         } catch (e: Exception) {
-            autoReconnectEnabled.set(false)
             disconnectInternal(clearHost = true)
             val msg = e.message ?: e.javaClass.simpleName
             _connectionState.value = ConnectionState.Failed(msg)
@@ -178,83 +167,68 @@ class SshManager(private val repository: HostRepository) {
             } catch (_: Exception) {
                 unexpected = reading.get()
             }
-            if (unexpected && autoReconnectEnabled.get()) {
+            if (unexpected) {
                 reading.set(false)
-                scope.launch { attemptAutoReconnect() }
-            } else if (unexpected) {
-                reading.set(false)
-                markTransportDead()
+                onShellReaderEndedUnexpectedly()
             }
-        }, "padssh-shell-reader").also { it.isDaemon = true; it.start() }
+        }, "padssh-shell-reader").also {
+            // Non-daemon: keep process alive while the shell is reading.
+            it.isDaemon = false
+            it.start()
+        }
     }
 
     /**
-     * Auto-reconnect after unexpected transport death. Not used for user [disconnect].
-     * Preserves terminal buffer and [currentHost]; restores shell on success.
+     * Shell channel died unexpectedly. Prefer silent shell reattach when TCP+auth
+     * are still alive (no user-visible reconnect UX). Otherwise mark Failed quietly.
+     * Never reconnects TCP / re-auths.
      */
-    private suspend fun attemptAutoReconnect() {
-        if (!autoReconnectEnabled.get()) {
-            markTransportDead()
-            return
-        }
-        if (!reconnecting.compareAndSet(false, true)) return
-        val host = currentHost
-        if (host == null) {
-            reconnecting.set(false)
-            markTransportDead()
-            return
-        }
-        try {
-            var lastError: String? = null
-            for (attempt in 1..MAX_RECONNECT_ATTEMPTS) {
-                if (!autoReconnectEnabled.get()) return
-                appendTerminal("\r\n[PadSSH] 正在重连…\r\n")
-                closeTransportKeepHost()
-                val backoffMs = if (attempt == 1) 1_000L else 3_000L
-                delay(backoffMs)
-                if (!autoReconnectEnabled.get()) return
-                try {
-                    val ssh = openAuthenticatedClient(host)
-                    client = ssh
-                    currentHost = host
-                    _connectionState.value = ConnectionState.Connected(host.id, host.name)
-                    startShellInternal()
-                    appendTerminal("\r\n[PadSSH] 重连成功\r\n")
-                    return
-                } catch (e: Exception) {
-                    lastError = e.message ?: e.javaClass.simpleName
-                    android.util.Log.w("PadSSH", "reconnect attempt $attempt failed: $lastError", e)
-                    appendTerminal("\r\n[PadSSH] 重连失败\r\n")
-                }
+    private fun onShellReaderEndedUnexpectedly() {
+        val ssh = client
+        if (ssh != null && ssh.isConnected && ssh.isAuthenticated) {
+            if (!shellReattaching.compareAndSet(false, true)) return
+            try {
+                android.util.Log.i("PadSSH", "shell channel ended; silently reopening shell (TCP still up)")
+                startShellInternal()
+            } catch (e: Exception) {
+                android.util.Log.w("PadSSH", "silent shell reattach failed: ${e.message}", e)
+                markTransportDead()
+            } finally {
+                shellReattaching.set(false)
             }
-            if (autoReconnectEnabled.get()) {
-                markTransportDead(lastError)
-            }
-        } finally {
-            reconnecting.set(false)
+        } else {
+            markTransportDead()
         }
     }
 
     private fun markTransportDead(detail: String? = null) {
-        autoReconnectEnabled.set(false)
-        closeTransportKeepHost()
-        currentHost = null
-        tofuVerifier = null
-        _hostKeyPrompt.value = null
+        disconnectInternal(clearHost = true)
         val msg = if (detail.isNullOrBlank()) "连接已断开" else "连接已断开：$detail"
         _connectionState.value = ConnectionState.Failed(msg)
     }
 
-    /** Close SSH/SFTP/shell but keep [currentHost] / verifier for reconnect. */
-    private fun closeTransportKeepHost() {
-        reading.set(false)
-        stopShellInternal()
-        closeSftpInternal()
-        try {
-            client?.disconnect()
-        } catch (_: Exception) {
+    /**
+     * Periodic keepalive pulse from [SshSessionService]. Sends an SSH keepalive
+     * global request when possible and verifies the TCP client is still connected.
+     * No reconnect — if dead, sets Failed("连接已断开").
+     */
+    fun pulseKeepAlive() {
+        val state = _connectionState.value
+        if (state !is ConnectionState.Connected) return
+        val ssh = client
+        if (ssh == null || !ssh.isConnected) {
+            markTransportDead()
+            return
         }
-        client = null
+        try {
+            // Prefer sshj built-in keepalive send path via global request (same as KeepAliveRunner).
+            ssh.connection.sendGlobalRequest("keepalive@openssh.com", true, ByteArray(0))
+        } catch (e: Exception) {
+            android.util.Log.w("PadSSH", "pulseKeepAlive send failed: ${e.message}")
+        }
+        if (!ssh.isConnected) {
+            markTransportDead()
+        }
     }
 
     private fun appendTerminal(chunk: String) {
@@ -269,7 +243,8 @@ class SshManager(private val repository: HostRepository) {
 
     private val writeLock = Any()
     private val writeExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-        Thread(r, "padssh-shell-writer").also { it.isDaemon = true }
+        // Non-daemon writer so session work is not killed by GC of daemon threads.
+        Thread(r, "padssh-shell-writer").also { it.isDaemon = false }
     }
 
     @Volatile
@@ -404,10 +379,8 @@ class SshManager(private val repository: HostRepository) {
         }
     }
 
-    /** User-initiated disconnect: disables auto-reconnect and tears everything down. */
+    /** User-initiated disconnect: tears everything down. */
     suspend fun disconnect() = withContext(Dispatchers.IO) {
-        autoReconnectEnabled.set(false)
-        reconnecting.set(false)
         disconnectInternal(clearHost = true)
         clearTerminalBuffer()
         _connectionState.value = ConnectionState.Disconnected
@@ -460,7 +433,7 @@ class SshManager(private val repository: HostRepository) {
     }
 
     companion object {
-        private const val KEEP_ALIVE_INTERVAL_SEC = 10
-        private const val MAX_RECONNECT_ATTEMPTS = 2
+        /** Seconds between SSH-level keepalives (sshj KeepAlive + service pulse). */
+        const val KEEP_ALIVE_INTERVAL_SEC = 5
     }
 }

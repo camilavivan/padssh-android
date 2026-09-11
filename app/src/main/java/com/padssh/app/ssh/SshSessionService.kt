@@ -21,12 +21,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Foreground service that keeps the process alive while an SSH session is connected.
  * Holds no duplicate SSH client — uses [PadSshApplication.sshManager].
  *
  * Acquires PARTIAL_WAKE_LOCK + WifiLock so OEM Wi‑Fi radio sleep does not kill TCP.
+ * While Connected, runs a non-daemon keepalive pulse every 5s (no auto-reconnect).
  */
 class SshSessionService : Service() {
 
@@ -34,6 +36,9 @@ class SshSessionService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var observing = false
+    @Volatile
+    private var keepAliveThread: Thread? = null
+    private val keepAliveStop = AtomicBoolean(true)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -68,6 +73,7 @@ class SshSessionService : Service() {
         acquireWakeLock()
         acquireWifiLock()
         observeConnection()
+        startKeepAliveLoop()
 
         val state = (application as PadSshApplication).sshManager.connectionState.value
         return if (state is ConnectionState.Connected || state is ConnectionState.Connecting) {
@@ -75,6 +81,24 @@ class SshSessionService : Service() {
         } else {
             START_NOT_STICKY
         }
+    }
+
+    /**
+     * User swiped the task away / closed the app from recents = explicit close.
+     * Disconnect SSH and stop the service.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        val app = application as PadSshApplication
+        // Block until disconnect finishes — process may be killed soon after.
+        try {
+            kotlinx.coroutines.runBlocking(Dispatchers.IO) {
+                app.sshManager.disconnect()
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("PadSSH", "onTaskRemoved disconnect: ${e.message}")
+        }
+        stopSession()
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun observeConnection() {
@@ -87,8 +111,11 @@ class SshSessionService : Service() {
                     is ConnectionState.Connected -> {
                         val nm = getSystemService(NotificationManager::class.java)
                         nm.notify(NOTIFICATION_ID, buildNotification(state.label))
+                        startKeepAliveLoop()
+                        // Do NOT stop FGS while Connected.
                     }
                     is ConnectionState.Disconnected, is ConnectionState.Failed -> {
+                        stopKeepAliveLoop()
                         stopSession()
                     }
                     else -> Unit
@@ -97,7 +124,50 @@ class SshSessionService : Service() {
         }
     }
 
+    /**
+     * Non-daemon keepalive thread: every 5s while Connected, call [SshManager.pulseKeepAlive].
+     * No reconnect — only detects dead TCP and marks Failed.
+     */
+    private fun startKeepAliveLoop() {
+        val existing = keepAliveThread
+        if (existing != null && existing.isAlive && !keepAliveStop.get()) return
+        stopKeepAliveLoop()
+        keepAliveStop.set(false)
+        val app = application as PadSshApplication
+        val t = Thread({
+            android.util.Log.d("PadSSH", "keepalive thread started")
+            try {
+                while (!keepAliveStop.get() && !Thread.currentThread().isInterrupted) {
+                    val state = app.sshManager.connectionState.value
+                    if (state !is ConnectionState.Connected) break
+                    try {
+                        app.sshManager.pulseKeepAlive()
+                    } catch (e: Exception) {
+                        android.util.Log.w("PadSSH", "keepalive pulse error: ${e.message}")
+                    }
+                    try {
+                        Thread.sleep(SshManager.KEEP_ALIVE_INTERVAL_SEC * 1_000L)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+            } finally {
+                android.util.Log.d("PadSSH", "keepalive thread ended")
+            }
+        }, "padssh-keepalive")
+        t.isDaemon = false
+        keepAliveThread = t
+        t.start()
+    }
+
+    private fun stopKeepAliveLoop() {
+        keepAliveStop.set(true)
+        keepAliveThread?.interrupt()
+        keepAliveThread = null
+    }
+
     private fun stopSession() {
+        stopKeepAliveLoop()
         releaseWifiLock()
         releaseWakeLock()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -202,6 +272,7 @@ class SshSessionService : Service() {
     }
 
     override fun onDestroy() {
+        stopKeepAliveLoop()
         releaseWifiLock()
         releaseWakeLock()
         scope.cancel()
