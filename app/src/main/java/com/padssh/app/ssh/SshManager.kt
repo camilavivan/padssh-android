@@ -15,11 +15,9 @@ import net.schmizz.sshj.connection.channel.direct.Session
 import net.schmizz.sshj.sftp.RemoteResourceInfo
 import net.schmizz.sshj.sftp.SFTPClient
 import net.schmizz.sshj.userauth.keyprovider.KeyProvider
-import org.bouncycastle.jce.provider.BouncyCastleProvider
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
-import java.security.Security
 import java.util.concurrent.atomic.AtomicBoolean
 
 sealed class ConnectionState {
@@ -32,10 +30,8 @@ sealed class ConnectionState {
 class SshManager(private val repository: HostRepository) {
 
     init {
-        if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
-            Security.removeProvider("BC")
-            Security.insertProviderAt(BouncyCastleProvider(), 1)
-        }
+        // Ensure full BC is installed (also done early in PadSshApplication).
+        SecurityProviders.install()
     }
 
     private var client: SSHClient? = null
@@ -69,7 +65,7 @@ class SshManager(private val repository: HostRepository) {
         clearTerminalBuffer()
         _connectionState.value = ConnectionState.Connecting
         try {
-            val ssh = SSHClient()
+            val ssh = SSHClient(AndroidSshConfig())
             val verifier = TofuHostKeyVerifier(repository) { decision ->
                 _hostKeyPrompt.value = decision
             }
