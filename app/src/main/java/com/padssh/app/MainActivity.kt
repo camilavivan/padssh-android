@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -12,6 +13,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -32,6 +34,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -60,6 +63,21 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 class MainActivity : ComponentActivity() {
 
     private val openTerminalEvents = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+
+    /**
+     * Set by [TerminalScreen] while visible. Consumes Bluetooth / hardware keys
+     * even when Compose focus is not on the input field.
+     */
+    @Volatile
+    var terminalKeyHandler: ((KeyEvent) -> Boolean)? = null
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val handler = terminalKeyHandler
+        if (handler != null && handler(event)) {
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
 
     @OptIn(ExperimentalMaterial3WindowSizeClassApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -141,132 +159,135 @@ private fun PadSshNav(
         }
     }
 
-    // If already Connected after Activity recreate, allow returning to terminal via banner;
-    // also auto-open once if connection is active and we're on home.
-    LaunchedEffect(conn) {
-        // no-op placeholder — banner handles UX; notification uses openTerminalEvents
-    }
-
-    if (conn is ConnectionState.Connecting) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            CircularProgressIndicator()
-        }
-    }
-
     val connected = conn as? ConnectionState.Connected
 
-    NavHost(navController = nav, startDestination = "home") {
-        composable("home") {
-            val selected = hosts.find { it.id == selectedId }
-            val returnToTerminal: (() -> Unit)? = connected?.let { c ->
-                { nav.navigate("terminal/${c.hostId}") }
-            }
-            if (isExpanded) {
-                TabletHostLayout(
-                    list = { mod ->
-                        HostListPane(
-                            hosts = hosts,
-                            selectedId = selectedId,
-                            onSelect = { selectedId = it.id },
-                            onAdd = { nav.navigate("edit/0") },
-                            onEdit = { nav.navigate("edit/${it.id}") },
-                            onDelete = {
-                                vm.deleteHost(it)
-                                if (selectedId == it.id) selectedId = null
-                            },
-                            onConnect = { host -> requestNotifThenConnect(host) },
-                            connectedLabel = connected?.label,
-                            onReturnToTerminal = returnToTerminal,
-                            modifier = mod,
-                        )
-                    },
-                    detail = { mod ->
-                        Box(mod) {
-                            if (selected == null) {
-                                HostDetailPlaceholder()
-                            } else {
-                                HostQuickDetail(
-                                    host = selected,
-                                    onEdit = { nav.navigate("edit/${selected.id}") },
-                                    onConnect = { requestNotifThenConnect(selected) },
-                                    connectedLabel = connected?.takeIf { it.hostId == selected.id }?.label,
-                                    onReturnToTerminal = returnToTerminal?.takeIf {
-                                        connected?.hostId == selected.id
-                                    },
-                                )
+    // Single root so the connecting spinner is a true overlay (not a sibling that
+    // can linger / steal hits). Overlay is only present while Connecting.
+    Box(Modifier.fillMaxSize()) {
+        NavHost(navController = nav, startDestination = "home") {
+            composable("home") {
+                val selected = hosts.find { it.id == selectedId }
+                val returnToTerminal: (() -> Unit)? = connected?.let { c ->
+                    { nav.navigate("terminal/${c.hostId}") }
+                }
+                if (isExpanded) {
+                    TabletHostLayout(
+                        list = { mod ->
+                            HostListPane(
+                                hosts = hosts,
+                                selectedId = selectedId,
+                                onSelect = { selectedId = it.id },
+                                onAdd = { nav.navigate("edit/0") },
+                                onEdit = { nav.navigate("edit/${it.id}") },
+                                onDelete = {
+                                    vm.deleteHost(it)
+                                    if (selectedId == it.id) selectedId = null
+                                },
+                                onConnect = { host -> requestNotifThenConnect(host) },
+                                connectedLabel = connected?.label,
+                                onReturnToTerminal = returnToTerminal,
+                                modifier = mod,
+                            )
+                        },
+                        detail = { mod ->
+                            Box(mod) {
+                                if (selected == null) {
+                                    HostDetailPlaceholder()
+                                } else {
+                                    HostQuickDetail(
+                                        host = selected,
+                                        onEdit = { nav.navigate("edit/${selected.id}") },
+                                        onConnect = { requestNotifThenConnect(selected) },
+                                        connectedLabel = connected?.takeIf { it.hostId == selected.id }?.label,
+                                        onReturnToTerminal = returnToTerminal?.takeIf {
+                                            connected?.hostId == selected.id
+                                        },
+                                    )
+                                }
                             }
+                        },
+                    )
+                } else {
+                    HostListPane(
+                        hosts = hosts,
+                        selectedId = selectedId,
+                        onSelect = { selectedId = it.id },
+                        onAdd = { nav.navigate("edit/0") },
+                        onEdit = { nav.navigate("edit/${it.id}") },
+                        onDelete = {
+                            vm.deleteHost(it)
+                            if (selectedId == it.id) selectedId = null
+                        },
+                        onConnect = { host -> requestNotifThenConnect(host) },
+                        connectedLabel = connected?.label,
+                        onReturnToTerminal = returnToTerminal,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+            }
+
+            composable(
+                "edit/{id}",
+                arguments = listOf(navArgument("id") { type = NavType.LongType }),
+            ) { entry ->
+                val id = entry.arguments?.getLong("id") ?: 0L
+                val initial = if (id == 0L) null else hosts.find { it.id == id }
+                HostEditScreen(
+                    initial = initial,
+                    onSave = { entity ->
+                        vm.saveHost(entity) { savedId ->
+                            selectedId = savedId
+                            nav.popBackStack()
                         }
                     },
+                    onBack = { nav.popBackStack() },
                 )
-            } else {
-                HostListPane(
-                    hosts = hosts,
-                    selectedId = selectedId,
-                    onSelect = { selectedId = it.id },
-                    onAdd = { nav.navigate("edit/0") },
-                    onEdit = { nav.navigate("edit/${it.id}") },
-                    onDelete = {
-                        vm.deleteHost(it)
-                        if (selectedId == it.id) selectedId = null
+            }
+
+            composable(
+                "terminal/{id}",
+                arguments = listOf(navArgument("id") { type = NavType.LongType }),
+            ) { entry ->
+                val id = entry.arguments?.getLong("id") ?: 0L
+                val host = hosts.find { it.id == id }
+                val title = when (val c = conn) {
+                    is ConnectionState.Connected -> c.label
+                    else -> host?.name ?: stringResource(R.string.terminal)
+                }
+                TerminalScreen(
+                    title = title,
+                    terminalBuffer = vm.terminalBuffer,
+                    onWrite = { vm.writeTerminal(it) },
+                    onWriteBytes = { vm.writeTerminalBytes(it) },
+                    onDisconnect = {
+                        vm.disconnect()
+                        nav.popBackStack("home", inclusive = false)
                     },
-                    onConnect = { host -> requestNotifThenConnect(host) },
-                    connectedLabel = connected?.label,
-                    onReturnToTerminal = returnToTerminal,
-                    modifier = Modifier.fillMaxSize(),
+                    onOpenSftp = { nav.navigate("sftp") },
+                    onBack = {
+                        // Leave terminal screen without dropping the SSH session.
+                        nav.popBackStack()
+                    },
+                )
+            }
+
+            composable("sftp") {
+                SftpScreen(
+                    sshManager = vm.getSshManager(),
+                    onBack = { nav.popBackStack() },
                 )
             }
         }
 
-        composable(
-            "edit/{id}",
-            arguments = listOf(navArgument("id") { type = NavType.LongType }),
-        ) { entry ->
-            val id = entry.arguments?.getLong("id") ?: 0L
-            val initial = if (id == 0L) null else hosts.find { it.id == id }
-            HostEditScreen(
-                initial = initial,
-                onSave = { entity ->
-                    vm.saveHost(entity) { savedId ->
-                        selectedId = savedId
-                        nav.popBackStack()
-                    }
-                },
-                onBack = { nav.popBackStack() },
-            )
-        }
-
-        composable(
-            "terminal/{id}",
-            arguments = listOf(navArgument("id") { type = NavType.LongType }),
-        ) { entry ->
-            val id = entry.arguments?.getLong("id") ?: 0L
-            val host = hosts.find { it.id == id }
-            val title = when (val c = conn) {
-                is ConnectionState.Connected -> c.label
-                else -> host?.name ?: stringResource(R.string.terminal)
+        if (conn is ConnectionState.Connecting) {
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.35f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator()
             }
-            TerminalScreen(
-                title = title,
-                terminalBuffer = vm.terminalBuffer,
-                onWrite = { vm.writeTerminal(it) },
-                onWriteBytes = { vm.writeTerminalBytes(it) },
-                onDisconnect = {
-                    vm.disconnect()
-                    nav.popBackStack("home", inclusive = false)
-                },
-                onOpenSftp = { nav.navigate("sftp") },
-                onBack = {
-                    // Leave terminal screen without dropping the SSH session.
-                    nav.popBackStack()
-                },
-            )
-        }
-
-        composable("sftp") {
-            SftpScreen(
-                sshManager = vm.getSshManager(),
-                onBack = { nav.popBackStack() },
-            )
         }
     }
 }

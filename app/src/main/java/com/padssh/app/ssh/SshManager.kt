@@ -155,21 +155,42 @@ class SshManager(private val repository: HostRepository) {
         _terminalBuffer.value = ""
     }
 
+    private val writeLock = Any()
+    private val writeExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "padssh-shell-writer").also { it.isDaemon = true }
+    }
+
+    @Volatile
+    var lastWriteError: String? = null
+        private set
+
     fun writeToShell(data: String) {
-        val out: OutputStream = shell?.outputStream ?: return
-        try {
-            out.write(data.toByteArray(Charsets.UTF_8))
-            out.flush()
-        } catch (_: Exception) {
-        }
+        writeBytesToShell(data.toByteArray(Charsets.UTF_8))
     }
 
     fun writeBytesToShell(bytes: ByteArray) {
-        val out: OutputStream = shell?.outputStream ?: return
-        try {
-            out.write(bytes)
-            out.flush()
-        } catch (_: Exception) {
+        // Never block the main/UI thread on a slow PTY write.
+        writeExecutor.execute {
+            synchronized(writeLock) {
+                try {
+                    var out: OutputStream? = shell?.outputStream
+                    if (out == null) {
+                        // One retry in case shell was just attached.
+                        out = shell?.outputStream
+                    }
+                    if (out == null) {
+                        lastWriteError = "shell outputStream is null"
+                        android.util.Log.w("PadSSH", lastWriteError!!)
+                        return@synchronized
+                    }
+                    out.write(bytes)
+                    out.flush()
+                    lastWriteError = null
+                } catch (e: Exception) {
+                    lastWriteError = e.message ?: e.javaClass.simpleName
+                    android.util.Log.w("PadSSH", "writeBytesToShell failed: $lastWriteError", e)
+                }
+            }
         }
     }
 
