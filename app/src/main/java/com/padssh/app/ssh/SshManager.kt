@@ -18,7 +18,12 @@ import net.schmizz.sshj.userauth.keyprovider.KeyProvider
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import net.schmizz.sshj.common.Message
+import net.schmizz.sshj.common.SSHPacket
 
 sealed class ConnectionState {
     data object Disconnected : ConnectionState()
@@ -49,6 +54,14 @@ class SshManager(private val repository: HostRepository) {
     /** Guards against concurrent silent shell reattach attempts. */
     private val shellReattaching = AtomicBoolean(false)
 
+    /** Debounce timestamp for visible write-failure banner. */
+    private val lastWriteFailNotifyMs = AtomicLong(0L)
+
+    /** Dedicated executor so pulse never blocks the keepalive thread on I/O. */
+    private val pulseExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "padssh-pulse").also { it.isDaemon = true }
+    }
+
     private val _connectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val connectionState: StateFlow<ConnectionState> = _connectionState.asStateFlow()
 
@@ -77,6 +90,7 @@ class SshManager(private val repository: HostRepository) {
             val ssh = openAuthenticatedClient(host)
             client = ssh
             currentHost = host
+            lastWriteFailNotifyMs.set(0L)
             _connectionState.value = ConnectionState.Connected(host.id, host.name)
             Result.success(Unit)
         } catch (e: Exception) {
@@ -208,9 +222,10 @@ class SshManager(private val repository: HostRepository) {
     }
 
     /**
-     * Periodic keepalive pulse from [SshSessionService]. Sends an SSH keepalive
-     * global request when possible and verifies the TCP client is still connected.
-     * No reconnect — if dead, sets Failed("连接已断开").
+     * Periodic keepalive pulse from [SshSessionService].
+     * Non-blocking: wantReply=false (never wait on reply / connection lock).
+     * Falls back to SSH IGNORE. Never blocks the keepalive thread on a reply.
+     * No reconnect — if clearly dead, sets Failed("连接已断开").
      */
     fun pulseKeepAlive() {
         val state = _connectionState.value
@@ -221,13 +236,73 @@ class SshManager(private val repository: HostRepository) {
             return
         }
         try {
-            // Prefer sshj built-in keepalive send path via global request (same as KeepAliveRunner).
-            ssh.connection.sendGlobalRequest("keepalive@openssh.com", true, ByteArray(0))
+            val future = pulseExecutor.submit(java.util.concurrent.Callable {
+                // wantReply=false: write GLOBAL_REQUEST and return; do not await reply.
+                try {
+                    ssh.connection.sendGlobalRequest(
+                        "keepalive@openssh.com",
+                        /* wantReply = */ false,
+                        ByteArray(0),
+                    )
+                } catch (e: Exception) {
+                    // Fallback: SSH IGNORE needs no reply (same as sshj Heartbeater).
+                    android.util.Log.w("PadSSH", "pulse keepalive@openssh.com failed, try IGNORE: ${e.message}")
+                    ssh.transport.write(SSHPacket(Message.IGNORE))
+                }
+                null
+            })
+            try {
+                future.get(PULSE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            } catch (e: TimeoutException) {
+                future.cancel(true)
+                android.util.Log.w("PadSSH", "pulseKeepAlive timed out after ${PULSE_TIMEOUT_MS}ms")
+                // Timeout alone is not proof of disconnect (may be brief socket stall).
+                if (!ssh.isConnected) {
+                    markTransportDead("keepalive timeout")
+                }
+                return
+            }
         } catch (e: Exception) {
             android.util.Log.w("PadSSH", "pulseKeepAlive send failed: ${e.message}")
+            // Only mark dead when transport is clearly gone.
+            if (!ssh.isConnected) {
+                markTransportDead(e.message)
+                return
+            }
         }
         if (!ssh.isConnected) {
             markTransportDead()
+        }
+    }
+
+    /**
+     * Called on Activity/Terminal ON_RESUME. If still Connected but shell is gone,
+     * silently reopen the shell on the existing TCP+auth session. Never reconnects TCP.
+     */
+    fun ensureSessionHealthy() {
+        val state = _connectionState.value
+        if (state !is ConnectionState.Connected) return
+        val ssh = client
+        if (ssh == null || !ssh.isConnected || !ssh.isAuthenticated) {
+            markTransportDead()
+            return
+        }
+        val sh = shell
+        val shellOk = try {
+            sh != null && sh.isOpen
+        } catch (_: Exception) {
+            false
+        }
+        if (shellOk) return
+        if (!shellReattaching.compareAndSet(false, true)) return
+        try {
+            android.util.Log.i("PadSSH", "ensureSessionHealthy: shell null/closed; silently reopening")
+            startShellInternal()
+        } catch (e: Exception) {
+            android.util.Log.w("PadSSH", "ensureSessionHealthy reattach failed: ${e.message}", e)
+            markTransportDead(e.message)
+        } finally {
+            shellReattaching.set(false)
         }
     }
 
@@ -258,6 +333,7 @@ class SshManager(private val repository: HostRepository) {
     fun writeBytesToShell(bytes: ByteArray) {
         // Never block the main/UI thread on a slow PTY write.
         writeExecutor.execute {
+            var needsHealthCheck = false
             synchronized(writeLock) {
                 try {
                     var out: OutputStream? = shell?.outputStream
@@ -268,17 +344,36 @@ class SshManager(private val repository: HostRepository) {
                     if (out == null) {
                         lastWriteError = "shell outputStream is null"
                         android.util.Log.w("PadSSH", lastWriteError!!)
-                        return@synchronized
+                        notifyWriteFailedOnce()
+                        needsHealthCheck = true
+                    } else {
+                        out.write(bytes)
+                        out.flush()
+                        lastWriteError = null
+                        // Successful write resets the one-shot failure banner debounce.
+                        lastWriteFailNotifyMs.set(0L)
                     }
-                    out.write(bytes)
-                    out.flush()
-                    lastWriteError = null
                 } catch (e: Exception) {
                     lastWriteError = e.message ?: e.javaClass.simpleName
                     android.util.Log.w("PadSSH", "writeBytesToShell failed: $lastWriteError", e)
+                    notifyWriteFailedOnce()
+                    needsHealthCheck = true
                 }
             }
+            // Outside writeLock: may reopen shell channel.
+            if (needsHealthCheck) {
+                ensureSessionHealthy()
+            }
         }
+    }
+
+    /** Append a one-shot visible failure line (debounced) so the UI is not silent. */
+    private fun notifyWriteFailedOnce() {
+        val now = System.currentTimeMillis()
+        val prev = lastWriteFailNotifyMs.get()
+        if (now - prev < WRITE_FAIL_DEBOUNCE_MS) return
+        if (!lastWriteFailNotifyMs.compareAndSet(prev, now)) return
+        appendTerminal("\r\n[PadSSH] 发送失败，连接可能已断开\r\n")
     }
 
     suspend fun changeWindowSize(cols: Int, rows: Int) = withContext(Dispatchers.IO) {
@@ -435,5 +530,9 @@ class SshManager(private val repository: HostRepository) {
     companion object {
         /** Seconds between SSH-level keepalives (sshj KeepAlive + service pulse). */
         const val KEEP_ALIVE_INTERVAL_SEC = 5
+        /** Max wait for a non-blocking pulse send (should return almost instantly). */
+        private const val PULSE_TIMEOUT_MS = 2_000L
+        /** Min interval between visible write-failure messages. */
+        private const val WRITE_FAIL_DEBOUNCE_MS = 5_000L
     }
 }

@@ -66,6 +66,13 @@ class HostViewModel(
 
     fun writeTerminalBytes(bytes: ByteArray) = sshManager.writeBytesToShell(bytes)
 
+    /** Resume health check: silent shell reattach if TCP still up. Runs on IO. */
+    fun ensureSessionHealthy() {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            sshManager.ensureSessionHealthy()
+        }
+    }
+
     fun getSshManager(): SshManager = sshManager
 
     class Factory(

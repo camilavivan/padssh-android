@@ -26,12 +26,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.LinkOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
@@ -57,7 +59,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.padssh.app.MainActivity
+import com.padssh.app.ssh.ConnectionState
 import com.padssh.app.R
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
@@ -83,11 +89,14 @@ fun stripAnsi(input: String): String {
 fun TerminalScreen(
     title: String,
     terminalBuffer: StateFlow<String>,
+    connectionState: StateFlow<ConnectionState>,
     onWrite: (String) -> Unit,
     onWriteBytes: (ByteArray) -> Unit,
     onDisconnect: () -> Unit,
     onOpenSftp: () -> Unit,
     onBack: () -> Unit,
+    onEnsureHealthy: () -> Unit = {},
+    onReconnect: () -> Unit = {},
 ) {
     val rawBuffer by terminalBuffer.collectAsState()
     val buffer = remember(rawBuffer) { stripAnsi(rawBuffer) }
@@ -97,10 +106,13 @@ fun TerminalScreen(
     val context = LocalContext.current
     val activity = context as? MainActivity
     val editTextRef = remember { mutableStateOf<TerminalEditText?>(null) }
+    val conn by connectionState.collectAsState()
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     val onWriteState = rememberUpdatedState(onWrite)
     val onWriteBytesState = rememberUpdatedState(onWriteBytes)
     val ctrlHeldState = rememberUpdatedState(ctrlHeld)
+    val onEnsureHealthyState = rememberUpdatedState(onEnsureHealthy)
 
     // System / gesture back: leave terminal once, never empty the NavHost.
     BackHandler(onBack = onBack)
@@ -112,6 +124,25 @@ fun TerminalScreen(
         onDispose {
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
+    }
+
+    // On resume: restore shell health + re-focus input (optional IME).
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                onEnsureHealthyState.value()
+                editTextRef.value?.let { et ->
+                    et.post {
+                        et.requestFocus()
+                        // Soft IME optional — helpful after screen switch on tablets.
+                        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                        imm?.showSoftInput(et, InputMethodManager.SHOW_IMPLICIT)
+                    }
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     LaunchedEffect(buffer) {
@@ -162,6 +193,31 @@ fun TerminalScreen(
     fun accessoryWrite(label: String, block: () -> Unit) {
         flashedKey = label
         block()
+    }
+
+    // Visible failure: do not leave user with silent no-response.
+    if (conn is ConnectionState.Failed) {
+        AlertDialog(
+            onDismissRequest = { /* stay until user chooses */ },
+            title = { Text(stringResource(R.string.connection_lost)) },
+            text = {
+                Text(
+                    (conn as ConnectionState.Failed).message.ifBlank {
+                        stringResource(R.string.connection_lost)
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = onReconnect) {
+                    Text(stringResource(R.string.reconnect))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onBack) {
+                    Text(stringResource(R.string.cancel))
+                }
+            },
+        )
     }
 
     Scaffold(

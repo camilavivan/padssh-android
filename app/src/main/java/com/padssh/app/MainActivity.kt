@@ -299,6 +299,7 @@ private fun PadSshNav(
                 TerminalScreen(
                     title = title,
                     terminalBuffer = vm.terminalBuffer,
+                    connectionState = vm.connectionState,
                     onWrite = { vm.writeTerminal(it) },
                     onWriteBytes = { vm.writeTerminalBytes(it) },
                     onDisconnect = {
@@ -313,6 +314,12 @@ private fun PadSshNav(
                                 launchSingleTop = true
                             }
                         }
+                    },
+                    onEnsureHealthy = { vm.ensureSessionHealthy() },
+                    onReconnect = {
+                        // User-initiated reconnect only (no background auto-reconnect).
+                        val h = host ?: return@TerminalScreen
+                        requestNotifThenConnect(h)
                     },
                 )
             }
