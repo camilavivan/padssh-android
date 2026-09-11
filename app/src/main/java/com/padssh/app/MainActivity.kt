@@ -1,10 +1,13 @@
 package com.padssh.app
 
 import android.Manifest
+import android.net.Uri
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.PowerManager
 import android.os.Bundle
+import android.provider.Settings
 import android.view.KeyEvent
 import android.view.WindowManager
 import android.widget.Toast
@@ -129,13 +132,21 @@ private fun PadSshNav(
     val context = LocalContext.current
     var selectedId by remember { mutableStateOf<Long?>(null) }
     var pendingConnect by remember { mutableStateOf<HostEntity?>(null) }
+    var showBatteryOptDialog by remember { mutableStateOf(false) }
+
+    fun afterConnectedNavigate(host: HostEntity) {
+        nav.navigate("terminal/${host.id}")
+        if (shouldPromptBatteryOptimizations(context)) {
+            showBatteryOptDialog = true
+        }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) {
         pendingConnect?.let { host ->
             pendingConnect = null
-            doConnect(vm, host, context) { nav.navigate("terminal/${host.id}") }
+            doConnect(vm, host, context, onSuccess = { afterConnectedNavigate(host) })
         }
     }
 
@@ -151,10 +162,38 @@ private fun PadSshNav(
                 return
             }
         }
-        doConnect(vm, host, context) { nav.navigate("terminal/${host.id}") }
+        doConnect(vm, host, context, onSuccess = { afterConnectedNavigate(host) })
     }
 
     HostKeyDialog(prompt) { trust -> vm.resolveHostKey(trust) }
+
+    if (showBatteryOptDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showBatteryOptDialog = false
+                markBatteryOptPrompted(context)
+            },
+            title = { Text(stringResource(R.string.battery_opt_title)) },
+            text = { Text(stringResource(R.string.battery_opt_message)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    showBatteryOptDialog = false
+                    markBatteryOptPrompted(context)
+                    launchIgnoreBatteryOptimizations(context)
+                }) {
+                    Text(stringResource(R.string.battery_opt_allow))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showBatteryOptDialog = false
+                    markBatteryOptPrompted(context)
+                }) {
+                    Text(stringResource(R.string.battery_opt_later))
+                }
+            },
+        )
+    }
 
     LaunchedEffect(openTerminalEvents) {
         openTerminalEvents.collect {
@@ -323,6 +362,35 @@ private fun doConnect(
                 Toast.LENGTH_LONG,
             ).show()
         }
+    }
+}
+
+private const val PREFS_NAME = "padssh_prefs"
+private const val PREF_BATTERY_OPT_PROMPTED = "battery_opt_prompted"
+
+/** Returns true if we should show the one-time ignore-battery-optimizations prompt. */
+private fun shouldPromptBatteryOptimizations(context: android.content.Context): Boolean {
+    val pm = context.getSystemService(PowerManager::class.java) ?: return false
+    if (pm.isIgnoringBatteryOptimizations(context.packageName)) return false
+    val prefs = context.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+    return !prefs.getBoolean(PREF_BATTERY_OPT_PROMPTED, false)
+}
+
+private fun markBatteryOptPrompted(context: android.content.Context) {
+    context.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE)
+        .edit()
+        .putBoolean(PREF_BATTERY_OPT_PROMPTED, true)
+        .apply()
+}
+
+private fun launchIgnoreBatteryOptimizations(context: android.content.Context) {
+    try {
+        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+            data = Uri.parse("package:${context.packageName}")
+        }
+        context.startActivity(intent)
+    } catch (e: Exception) {
+        android.util.Log.w("PadSSH", "battery opt intent failed: ${e.message}")
     }
 }
 

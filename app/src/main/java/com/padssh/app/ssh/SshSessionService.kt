@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -24,11 +25,14 @@ import kotlinx.coroutines.launch
 /**
  * Foreground service that keeps the process alive while an SSH session is connected.
  * Holds no duplicate SSH client — uses [PadSshApplication.sshManager].
+ *
+ * Acquires PARTIAL_WAKE_LOCK + WifiLock so OEM Wi‑Fi radio sleep does not kill TCP.
  */
 class SshSessionService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var observing = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -62,6 +66,7 @@ class SshSessionService : Service() {
         }
 
         acquireWakeLock()
+        acquireWifiLock()
         observeConnection()
 
         val state = (application as PadSshApplication).sshManager.connectionState.value
@@ -93,6 +98,7 @@ class SshSessionService : Service() {
     }
 
     private fun stopSession() {
+        releaseWifiLock()
         releaseWakeLock()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -118,6 +124,29 @@ class SshSessionService : Service() {
         } catch (_: Exception) {
         }
         wakeLock = null
+    }
+
+    @Suppress("DEPRECATION")
+    private fun acquireWifiLock() {
+        if (wifiLock?.isHeld == true) return
+        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+        } else {
+            WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        }
+        wifiLock = wifi.createWifiLock(mode, "PadSSH::Wifi").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+    }
+
+    private fun releaseWifiLock() {
+        try {
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+        } catch (_: Exception) {
+        }
+        wifiLock = null
     }
 
     private fun createChannel() {
@@ -173,6 +202,7 @@ class SshSessionService : Service() {
     }
 
     override fun onDestroy() {
+        releaseWifiLock()
         releaseWakeLock()
         scope.cancel()
         super.onDestroy()

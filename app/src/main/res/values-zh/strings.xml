@@ -51,5 +51,9 @@
     <string name="session_channel_name">SSH 会话</string>
     <string name="session_channel_desc">保持 SSH 连接在后台运行</string>
     <string name="session_notification_title">PadSSH 已连接 — %1$s</string>
-    <string name="session_notification_text">点击返回应用，或断开连接</string>
+    <string name="session_notification_text">保持连接中 — 点击返回应用，或断开连接</string>
+    <string name="battery_opt_title">忽略电池优化</string>
+    <string name="battery_opt_message">为减少切屏后 SSH 被系统杀掉，建议允许 PadSSH 忽略电池优化。仅提示一次。</string>
+    <string name="battery_opt_allow">去允许</string>
+    <string name="battery_opt_later">稍后</string>
 </resources>

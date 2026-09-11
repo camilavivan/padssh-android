@@ -1,6 +1,8 @@
 package com.padssh.app.ui.terminal
 
+import android.app.Activity
 import android.content.Context
+import android.view.WindowManager
 import android.view.KeyEvent as AndroidKeyEvent
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.compose.BackHandler
@@ -102,6 +104,15 @@ fun TerminalScreen(
 
     // System / gesture back: leave terminal once, never empty the NavHost.
     BackHandler(onBack = onBack)
+
+    // Keep screen on while terminal is visible (foreground aid only).
+    DisposableEffect(Unit) {
+        val window = (context as? Activity)?.window
+        window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        onDispose {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
 
     LaunchedEffect(buffer) {
         scroll.animateScrollTo(scroll.maxValue)
