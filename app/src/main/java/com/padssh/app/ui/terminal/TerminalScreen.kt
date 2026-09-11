@@ -19,12 +19,12 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,7 +38,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.padssh.app.R
-import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
 
 private val TermBg = Color(0xFF0D1117)
 private val TermFg = Color(0xFFE6EDF3)
@@ -58,26 +58,18 @@ fun stripAnsi(input: String): String {
 @Composable
 fun TerminalScreen(
     title: String,
-    outputFlow: SharedFlow<String>,
+    terminalBuffer: StateFlow<String>,
     onWrite: (String) -> Unit,
     onWriteBytes: (ByteArray) -> Unit,
     onDisconnect: () -> Unit,
     onOpenSftp: () -> Unit,
     onBack: () -> Unit,
 ) {
-    var buffer by remember { mutableStateOf("") }
+    val rawBuffer by terminalBuffer.collectAsState()
+    val buffer = remember(rawBuffer) { stripAnsi(rawBuffer) }
     var input by remember { mutableStateOf("") }
     var ctrlHeld by remember { mutableStateOf(false) }
     val scroll = rememberScrollState()
-
-    LaunchedEffect(outputFlow) {
-        outputFlow.collect { chunk ->
-            buffer += stripAnsi(chunk)
-            if (buffer.length > 200_000) {
-                buffer = buffer.takeLast(150_000)
-            }
-        }
-    }
 
     LaunchedEffect(buffer) {
         scroll.animateScrollTo(scroll.maxValue)

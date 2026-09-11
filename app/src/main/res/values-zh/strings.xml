@@ -45,4 +45,11 @@
     <string name="tab">Tab</string>
     <string name="ctrl">Ctrl</string>
     <string name="ctrl_c">Ctrl-C</string>
+
+    <string name="return_to_terminal">返回终端</string>
+    <string name="session_active">已连接 — %1$s</string>
+    <string name="session_channel_name">SSH 会话</string>
+    <string name="session_channel_desc">保持 SSH 连接在后台运行</string>
+    <string name="session_notification_title">PadSSH 已连接 — %1$s</string>
+    <string name="session_notification_text">点击返回应用，或断开连接</string>
 </resources>

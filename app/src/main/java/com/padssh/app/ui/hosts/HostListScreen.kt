@@ -10,7 +10,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -21,6 +20,7 @@ import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -57,6 +57,8 @@ fun HostListPane(
     onEdit: (HostEntity) -> Unit,
     onDelete: (HostEntity) -> Unit,
     onConnect: (HostEntity) -> Unit,
+    connectedLabel: String? = null,
+    onReturnToTerminal: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     var pendingDelete by remember { mutableStateOf<HostEntity?>(null) }
@@ -72,36 +74,72 @@ fun HostListPane(
             }
         },
     ) { padding ->
-        if (hosts.isEmpty()) {
-            Box(
-                Modifier
-                    .fillMaxSize()
-                    .padding(padding),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    stringResource(R.string.no_hosts),
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(padding),
+        ) {
+            if (connectedLabel != null && onReturnToTerminal != null) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                        .clickable(onClick = onReturnToTerminal),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                    ),
+                ) {
+                    Row(
+                        Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(Icons.Default.Terminal, contentDescription = null)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                stringResource(R.string.session_active, connectedLabel),
+                                style = MaterialTheme.typography.titleSmall,
+                            )
+                            Text(
+                                stringResource(R.string.return_to_terminal),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                            )
+                        }
+                        TextButton(onClick = onReturnToTerminal) {
+                            Text(stringResource(R.string.return_to_terminal))
+                        }
+                    }
+                }
             }
-        } else {
-            LazyColumn(
-                Modifier
-                    .fillMaxSize()
-                    .padding(padding),
-                contentPadding = PaddingValues(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(hosts, key = { it.id }) { host ->
-                    HostCard(
-                        host = host,
-                        selected = host.id == selectedId,
-                        onClick = { onSelect(host) },
-                        onEdit = { onEdit(host) },
-                        onDelete = { pendingDelete = host },
-                        onConnect = { onConnect(host) },
+
+            if (hosts.isEmpty()) {
+                Box(
+                    Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        stringResource(R.string.no_hosts),
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+            } else {
+                LazyColumn(
+                    Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(hosts, key = { it.id }) { host ->
+                        HostCard(
+                            host = host,
+                            selected = host.id == selectedId,
+                            onClick = { onSelect(host) },
+                            onEdit = { onEdit(host) },
+                            onDelete = { pendingDelete = host },
+                            onConnect = { onConnect(host) },
+                        )
+                    }
                 }
             }
         }

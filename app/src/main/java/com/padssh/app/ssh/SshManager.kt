@@ -50,6 +50,10 @@ class SshManager(private val repository: HostRepository) {
     private val _terminalOutput = MutableSharedFlow<String>(extraBufferCapacity = 256)
     val terminalOutput: SharedFlow<String> = _terminalOutput.asSharedFlow()
 
+    /** Session-scoped terminal buffer that survives Activity recreation. */
+    private val _terminalBuffer = MutableStateFlow("")
+    val terminalBuffer: StateFlow<String> = _terminalBuffer.asStateFlow()
+
     private val _hostKeyPrompt = MutableStateFlow<HostKeyDecision?>(null)
     val hostKeyPrompt: StateFlow<HostKeyDecision?> = _hostKeyPrompt.asStateFlow()
 
@@ -62,6 +66,7 @@ class SshManager(private val repository: HostRepository) {
 
     suspend fun connect(host: HostEntity): Result<Unit> = withContext(Dispatchers.IO) {
         disconnectInternal()
+        clearTerminalBuffer()
         _connectionState.value = ConnectionState.Connecting
         try {
             val ssh = SSHClient()
@@ -71,7 +76,9 @@ class SshManager(private val repository: HostRepository) {
             tofuVerifier = verifier
             ssh.addHostKeyVerifier(verifier)
             ssh.connectTimeout = 15_000
-            ssh.timeout = 30_000
+            // 0 = infinite socket read timeout; shell reader thread blocks on read.
+            // Keep-alive handles idle detection instead of a short read timeout.
+            ssh.timeout = 0
             ssh.connect(host.host, host.port)
 
             if (host.useKeyAuth && !host.privateKey.isNullOrBlank()) {
@@ -90,6 +97,9 @@ class SshManager(private val repository: HostRepository) {
             } else {
                 ssh.authPassword(host.username, host.password ?: "")
             }
+
+            // SSH-level keep-alive so idle sessions are not dropped by NAT/server.
+            ssh.connection.keepAlive.keepAliveInterval = 30
 
             client = ssh
             _connectionState.value = ConnectionState.Connected(host.id, host.name)
@@ -119,12 +129,22 @@ class SshManager(private val repository: HostRepository) {
                     val n = input.read(buf)
                     if (n < 0) break
                     if (n > 0) {
-                        _terminalOutput.tryEmit(String(buf, 0, n, Charsets.UTF_8))
+                        appendTerminal(String(buf, 0, n, Charsets.UTF_8))
                     }
                 }
             } catch (_: Exception) {
             }
         }, "padssh-shell-reader").also { it.isDaemon = true; it.start() }
+    }
+
+    private fun appendTerminal(chunk: String) {
+        _terminalOutput.tryEmit(chunk)
+        val next = _terminalBuffer.value + chunk
+        _terminalBuffer.value = if (next.length > 200_000) next.takeLast(150_000) else next
+    }
+
+    fun clearTerminalBuffer() {
+        _terminalBuffer.value = ""
     }
 
     fun writeToShell(data: String) {
@@ -179,6 +199,7 @@ class SshManager(private val repository: HostRepository) {
 
     suspend fun disconnect() = withContext(Dispatchers.IO) {
         disconnectInternal()
+        clearTerminalBuffer()
         _connectionState.value = ConnectionState.Disconnected
     }
 
