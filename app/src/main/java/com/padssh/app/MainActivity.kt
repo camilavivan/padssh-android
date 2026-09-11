@@ -55,6 +55,7 @@ import com.padssh.app.ui.hosts.HostEditScreen
 import com.padssh.app.ui.hosts.HostListPane
 import com.padssh.app.ui.hosts.TabletHostLayout
 import com.padssh.app.ui.sftp.SftpScreen
+import com.padssh.app.ui.terminal.TerminalKeyMapper
 import com.padssh.app.ui.terminal.TerminalScreen
 import com.padssh.app.ui.theme.PadSshTheme
 import com.padssh.app.viewmodel.HostViewModel
@@ -73,8 +74,10 @@ class MainActivity : ComponentActivity() {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val handler = terminalKeyHandler
-        if (handler != null && handler(event)) {
-            return true
+        if (handler != null) {
+            if (handler(event)) return true
+            // Terminal visible: never let Enter / NumpadEnter / DpadCenter activate UI.
+            if (TerminalKeyMapper.mustConsume(event.keyCode)) return true
         }
         return super.dispatchKeyEvent(event)
     }
@@ -265,8 +268,12 @@ private fun PadSshNav(
                     },
                     onOpenSftp = { nav.navigate("sftp") },
                     onBack = {
-                        // Leave terminal screen without dropping the SSH session.
-                        nav.popBackStack()
+                        // Leave terminal without dropping SSH; never pop past home (white screen).
+                        if (!nav.popBackStack("home", inclusive = false)) {
+                            nav.navigate("home") {
+                                launchSingleTop = true
+                            }
+                        }
                     },
                 )
             }

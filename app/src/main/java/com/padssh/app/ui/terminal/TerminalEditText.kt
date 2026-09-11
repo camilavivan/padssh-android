@@ -34,6 +34,7 @@ class TerminalEditText @JvmOverloads constructor(
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // Consume terminal keys (esp. Enter) before super so they never click UI.
         if (mapKeyEvent(event)) return true
         return super.dispatchKeyEvent(event)
     }
@@ -100,114 +101,15 @@ class TerminalEditText @JvmOverloads constructor(
     }
 
     private fun mapKeyEvent(event: KeyEvent): Boolean {
-        // Only act on ACTION_DOWN for writes; consume matching ACTION_UP.
-        val isDown = event.action == KeyEvent.ACTION_DOWN
-        val isUp = event.action == KeyEvent.ACTION_UP
-
-        fun consumeUp(): Boolean = isUp
-
-        when (event.keyCode) {
-            KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
-                if (isDown) onWrite?.invoke("\r")
-                return isDown || consumeUp()
-            }
-            KeyEvent.KEYCODE_DEL -> {
-                if (isDown) onWriteBytes?.invoke(byteArrayOf(0x7F))
-                return isDown || consumeUp()
-            }
-            KeyEvent.KEYCODE_FORWARD_DEL -> {
-                if (isDown) {
-                    onWriteBytes?.invoke(
-                        byteArrayOf(0x1B, '['.code.toByte(), '3'.code.toByte(), '~'.code.toByte()),
-                    )
-                }
-                return isDown || consumeUp()
-            }
-            KeyEvent.KEYCODE_TAB -> {
-                if (isDown) onWrite?.invoke("\t")
-                return isDown || consumeUp()
-            }
-            KeyEvent.KEYCODE_ESCAPE -> {
-                if (isDown) onWriteBytes?.invoke(byteArrayOf(0x1B))
-                return isDown || consumeUp()
-            }
-            KeyEvent.KEYCODE_DPAD_UP -> {
-                if (isDown) {
-                    onWriteBytes?.invoke(
-                        byteArrayOf(0x1B, '['.code.toByte(), 'A'.code.toByte()),
-                    )
-                }
-                return isDown || consumeUp()
-            }
-            KeyEvent.KEYCODE_DPAD_DOWN -> {
-                if (isDown) {
-                    onWriteBytes?.invoke(
-                        byteArrayOf(0x1B, '['.code.toByte(), 'B'.code.toByte()),
-                    )
-                }
-                return isDown || consumeUp()
-            }
-            KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                if (isDown) {
-                    onWriteBytes?.invoke(
-                        byteArrayOf(0x1B, '['.code.toByte(), 'C'.code.toByte()),
-                    )
-                }
-                return isDown || consumeUp()
-            }
-            KeyEvent.KEYCODE_DPAD_LEFT -> {
-                if (isDown) {
-                    onWriteBytes?.invoke(
-                        byteArrayOf(0x1B, '['.code.toByte(), 'D'.code.toByte()),
-                    )
-                }
-                return isDown || consumeUp()
-            }
-        }
-
-        if (!isDown) {
-            // Consume KeyUp for printable / ctrl letters we handled on KeyDown.
-            val unicode = event.unicodeChar
-            return unicode != 0 && (unicode in 1..26 || !Character.isISOControl(unicode))
-        }
-
-        val ctrlHeld = ctrlHeldProvider?.invoke() == true
-        val ctrl = event.isCtrlPressed || ctrlHeld
-
-        // Prefer unicodeChar (already maps Ctrl+C → 3 when hardware Ctrl is held).
-        val unicode = event.unicodeChar
-        if (unicode in 1..26) {
-            onWriteBytes?.invoke(byteArrayOf(unicode.toByte()))
-            if (ctrlHeld) onCtrlHeldChange?.invoke(false)
-            return true
-        }
-
-        if (unicode != 0 && !Character.isISOControl(unicode)) {
-            val ch = unicode.toChar()
-            if (ctrl) {
-                val lower = ch.lowercaseChar()
-                if (lower in 'a'..'z') {
-                    onWriteBytes?.invoke(byteArrayOf((lower.code - 96).toByte()))
-                    if (ctrlHeld) onCtrlHeldChange?.invoke(false)
-                    return true
-                }
-            }
-            onWrite?.invoke(String(Character.toChars(unicode)))
-            if (ctrlHeld) onCtrlHeldChange?.invoke(false)
-            return true
-        }
-
-        // Soft-Ctrl + letter when unicodeChar is plain letter without META_CTRL.
-        if (ctrlHeld && !event.isCtrlPressed) {
-            val ch = event.displayLabel.lowercaseChar()
-            if (ch in 'a'..'z') {
-                onWriteBytes?.invoke(byteArrayOf((ch.code - 96).toByte()))
-                onCtrlHeldChange?.invoke(false)
-                return true
-            }
-        }
-
-        return false
+        val write = onWrite ?: return TerminalKeyMapper.mustConsume(event.keyCode)
+        val writeBytes = onWriteBytes ?: return TerminalKeyMapper.mustConsume(event.keyCode)
+        return TerminalKeyMapper.map(
+            event = event,
+            ctrlHeld = ctrlHeldProvider?.invoke() == true,
+            onWrite = write,
+            onWriteBytes = writeBytes,
+            onCtrlHeldChange = onCtrlHeldChange,
+        )
     }
 
     companion object {
@@ -229,8 +131,23 @@ class TerminalEditText @JvmOverloads constructor(
                     EditorInfo.IME_FLAG_NO_FULLSCREEN or
                     EditorInfo.IME_FLAG_NO_EXTRACT_UI
                 importantForAutofill = IMPORTANT_FOR_AUTOFILL_NO
+                isFocusable = true
+                isFocusableInTouchMode = true
                 // Avoid system accent highlight stealing focus visuals on tablets.
                 highlightColor = ContextCompat.getColor(context, android.R.color.transparent)
+                setOnEditorActionListener { _, actionId, event ->
+                    if (actionId == EditorInfo.IME_ACTION_SEND ||
+                        (event != null &&
+                            event.action == KeyEvent.ACTION_DOWN &&
+                            (event.keyCode == KeyEvent.KEYCODE_ENTER ||
+                                event.keyCode == KeyEvent.KEYCODE_NUMPAD_ENTER))
+                    ) {
+                        onWrite?.invoke("\r")
+                        true
+                    } else {
+                        false
+                    }
+                }
             }
         }
     }

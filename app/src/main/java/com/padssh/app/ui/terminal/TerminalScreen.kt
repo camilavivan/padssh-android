@@ -3,9 +3,12 @@ package com.padssh.app.ui.terminal
 import android.content.Context
 import android.view.KeyEvent as AndroidKeyEvent
 import android.view.inputmethod.InputMethodManager
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,12 +39,17 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -88,6 +96,13 @@ fun TerminalScreen(
     val activity = context as? MainActivity
     val editTextRef = remember { mutableStateOf<TerminalEditText?>(null) }
 
+    val onWriteState = rememberUpdatedState(onWrite)
+    val onWriteBytesState = rememberUpdatedState(onWriteBytes)
+    val ctrlHeldState = rememberUpdatedState(ctrlHeld)
+
+    // System / gesture back: leave terminal once, never empty the NavHost.
+    BackHandler(onBack = onBack)
+
     LaunchedEffect(buffer) {
         scroll.animateScrollTo(scroll.maxValue)
     }
@@ -99,10 +114,22 @@ fun TerminalScreen(
         }
     }
 
-    // Activity-level Bluetooth / hardware key fallback when Compose focus is wrong.
+    // Activity-level Bluetooth / hardware key handler. Must map keys itself
+    // (not only via EditText) so Enter never reaches a focused TopAppBar button
+    // when editTextRef is null or Compose stole focus.
     DisposableEffect(activity) {
-        val handler: (AndroidKeyEvent) -> Boolean = { event ->
-            editTextRef.value?.handleHardwareKey(event) ?: false
+        val handler: (AndroidKeyEvent) -> Boolean = handler@{ event ->
+            val mapped = TerminalKeyMapper.map(
+                event = event,
+                ctrlHeld = ctrlHeldState.value,
+                onWrite = onWriteState.value,
+                onWriteBytes = onWriteBytesState.value,
+                onCtrlHeldChange = { ctrlHeld = it },
+            )
+            if (mapped) return@handler true
+            // Hard-consume Enter variants even if mapper returned false.
+            if (TerminalKeyMapper.mustConsume(event.keyCode)) return@handler true
+            false
         }
         activity?.terminalKeyHandler = handler
         onDispose {
@@ -131,15 +158,35 @@ fun TerminalScreen(
             TopAppBar(
                 title = { Text(title) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null)
-                    }
+                    // Non-focusable back: Icon + clickable, not IconButton.
+                    // KEYCODE_ENTER must never activate this control.
+                    val backInteraction = remember { MutableInteractionSource() }
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = stringResource(R.string.cancel),
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .clickable(
+                                interactionSource = backInteraction,
+                                indication = androidx.compose.material3.ripple(bounded = false),
+                                role = Role.Button,
+                                onClick = onBack,
+                            )
+                            .semantics { role = Role.Button }
+                            .focusProperties { canFocus = false },
+                    )
                 },
                 actions = {
-                    IconButton(onClick = onOpenSftp) {
+                    IconButton(
+                        onClick = onOpenSftp,
+                        modifier = Modifier.focusProperties { canFocus = false },
+                    ) {
                         Icon(Icons.Default.Folder, contentDescription = stringResource(R.string.sftp))
                     }
-                    IconButton(onClick = onDisconnect) {
+                    IconButton(
+                        onClick = onDisconnect,
+                        modifier = Modifier.focusProperties { canFocus = false },
+                    ) {
                         Icon(Icons.Default.LinkOff, contentDescription = stringResource(R.string.disconnect))
                     }
                 },
@@ -267,7 +314,7 @@ private fun AccessoryBar(
             .padding(horizontal = 6.dp, vertical = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        // Literal labels — avoid locale remapping of "tab" to「标签页」.
+        // Literal "Tab" — never stringResource(R.string.tab) (can become「标签页」).
         AccessoryKey("Esc", onEsc, emphasized = flashedKey == "Esc")
         AccessoryKey("Tab", onTab, emphasized = flashedKey == "Tab")
         AccessoryKey(
@@ -293,7 +340,8 @@ private fun AccessoryKey(
         onClick = onClick,
         modifier = Modifier
             .minimumInteractiveComponentSize()
-            .heightIn(min = 48.dp),
+            .heightIn(min = 48.dp)
+            .focusProperties { canFocus = false },
     ) {
         Text(
             text = label,
